@@ -10,7 +10,7 @@ export default function App() {
   const [after, setAfter] = useState<File | null>(null);
   const [beforeUrl, setBeforeUrl] = useState<string | null>(null);
   const [afterUrl, setAfterUrl] = useState<string | null>(null);
-  const [sensitivity, setSensitivity] = useState<number>(30); // 0..100; higher = more sensitive
+  const [sensitivity, setSensitivity] = useState<number>(100); // 0..100; higher = more sensitive
   const [regions, setRegions] = useState<Region[]>([]);
   const [result, setResult] = useState<ComparisonResult | null>(null);
   const [busy, setBusy] = useState(false);

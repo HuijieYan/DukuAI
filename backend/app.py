@@ -1,11 +1,10 @@
-# duku-visual-diff backend (FastAPI) — with absolute URLs and /recompute
+# duku-visual-diff backend (FastAPI) — previous stable (no overlay)
 import io
 import os
 import json
 import uuid
 from datetime import datetime
 from typing import List, Optional, Dict
-import math
 
 import numpy as np
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Header, Query, Request
@@ -22,14 +21,22 @@ API_KEY_ENV = "DUKU_API_KEY"
 
 app = FastAPI(title="Duku AI - Visual Change Detection MVP", version="0.2.0")
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173","http://127.0.0.1:5173","http://localhost:3000","http://127.0.0.1:3000","*"],
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "*",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# serve stored images
 app.mount("/files", StaticFiles(directory=STORAGE_ROOT), name="files")
 
 class Region(BaseModel):
@@ -51,7 +58,7 @@ class ComparisonOut(BaseModel):
 def _auth_check(x_api_key: Optional[str]):
     needed = os.getenv(API_KEY_ENV)
     if not needed:
-        return
+        return  # auth disabled
     if not x_api_key or x_api_key != needed:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
@@ -68,21 +75,27 @@ def resize_to_match(a: Image.Image, b: Image.Image) -> Image.Image:
         return b
     return b.resize(a.size, Image.BILINEAR)
 
-def apply_ignore_regions(mask: np.ndarray, regions: List[Region]) -> None:
-    h, w = mask.shape
-    PAD = 2  # pixels of safety to cover anti-aliased edges
-
+def sanitize_regions(regions: List[Region]) -> List[Region]:
+    safe: List[Region] = []
     for r in regions:
-        # Convert normalized -> pixel box with floor/ceil, then pad
-        x0 = math.floor(r.x * w) - PAD
-        y0 = math.floor(r.y * h) - PAD
-        x1 = math.ceil((r.x + r.w) * w) + PAD
-        y1 = math.ceil((r.y + r.h) * h) + PAD
+        x = max(0.0, min(1.0, float(r.x)))
+        y = max(0.0, min(1.0, float(r.y)))
+        w = max(0.0, min(1.0, float(r.w)))
+        h = max(0.0, min(1.0, float(r.h)))
+        if w <= 0.0 or h <= 0.0:
+            continue
+        if x + w > 1.0: w = 1.0 - x
+        if y + h > 1.0: h = 1.0 - y
+        safe.append(Region(x=x, y=y, w=w, h=h))
+    return safe
 
-        # clamp to mask bounds
-        x0 = max(0, x0); y0 = max(0, y0)
-        x1 = min(w, x1); y1 = min(h, y1)
-
+def apply_ignore_regions(mask: np.ndarray, regions: List[Region], pad_px: int = 2) -> None:
+    h, w = mask.shape
+    for r in sanitize_regions(regions):
+        x0 = max(0, int(r.x * w) - pad_px)
+        y0 = max(0, int(r.y * h) - pad_px)
+        x1 = min(w, int((r.x + r.w) * w) + pad_px)
+        y1 = min(h, int((r.y + r.h) * h) + pad_px)
         if x1 > x0 and y1 > y0:
             mask[y0:y1, x0:x1] = False
 
@@ -90,9 +103,11 @@ def make_diff_image(before: Image.Image, mask: np.ndarray) -> Image.Image:
     base = before.convert("RGBA")
     overlay = Image.new("RGBA", base.size, (255, 0, 0, 0))
     alpha = 120
-    arr = np.array(overlay); arr[mask] = [255, 0, 0, alpha]
+    arr = np.array(overlay)
+    arr[mask] = [255, 0, 0, alpha]
     overlay = Image.fromarray(arr, mode="RGBA")
-    return Image.alpha_composite(base, overlay)
+    out = Image.alpha_composite(base, overlay)
+    return out
 
 def compute_diff(before: Image.Image, after: Image.Image, threshold: int, regions: List[Region]):
     after_aligned = resize_to_match(before, after)
@@ -102,16 +117,22 @@ def compute_diff(before: Image.Image, after: Image.Image, threshold: int, region
     diff_gray = diff.max(axis=2)
     mask = diff_gray > threshold
     apply_ignore_regions(mask, regions)
-    changed = int(mask.sum()); total = mask.size
+    changed = int(mask.sum())
+    total = mask.size
     pct = (changed / total) * 100.0
     return {"mask": mask, "diff_pct": float(round(pct, 4)), "size": before.size}
 
 def save_result(result_id: str, before: Image.Image, after: Image.Image, diff_img: Image.Image, meta):
-    d = os.path.join(STORAGE_ROOT, result_id); os.makedirs(d, exist_ok=True)
-    before.save(os.path.join(d, "before.png"))
-    after.save(os.path.join(d, "after.png"))
-    diff_img.save(os.path.join(d, "diff.png"))
-    with open(os.path.join(d, "meta.json"), "w", encoding="utf-8") as f:
+    d = os.path.join(STORAGE_ROOT, result_id)
+    os.makedirs(d, exist_ok=True)
+    before_path = os.path.join(d, "before.png")
+    after_path = os.path.join(d, "after.png")
+    diff_path = os.path.join(d, "diff.png")
+    meta_path = os.path.join(d, "meta.json")
+    before.save(before_path)
+    after.save(after_path)
+    diff_img.save(diff_path)
+    with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     return {
         "before": f"/files/{result_id}/before.png",
@@ -137,7 +158,8 @@ async def create_comparison(
     regions: List[Region] = []
     if ignore_regions:
         try:
-            regions = [Region(**r) for r in json.loads(ignore_regions)]
+            loaded = json.loads(ignore_regions)
+            regions = [Region(**r) for r in loaded]
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Invalid ignore_regions: {e}")
     b_img = load_image_from_upload(before)
@@ -203,7 +225,8 @@ def recompute(
 ):
     _auth_check(x_api_key)
     d = os.path.join(STORAGE_ROOT, result_id)
-    b_path = os.path.join(d, "before.png"); a_path = os.path.join(d, "after.png")
+    b_path = os.path.join(d, "before.png")
+    a_path = os.path.join(d, "after.png")
     if not (os.path.exists(b_path) and os.path.exists(a_path)):
         raise HTTPException(status_code=404, detail="Source images not found")
     regions: List[Region] = []
@@ -232,4 +255,4 @@ def recompute(
 
 @app.get("/health")
 def health():
-  return {"ok": True}
+    return {"ok": True}
