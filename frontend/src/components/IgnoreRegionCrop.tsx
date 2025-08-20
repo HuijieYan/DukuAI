@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import ReactCrop, { Crop } from "react-image-crop";
 import "react-image-crop/dist/ReactCrop.css";
 import type { Region } from "../types";
@@ -8,53 +8,81 @@ type Props = {
   regions: Region[];                  // we use the first region (single selection)
   onChange: (regions: Region[]) => void;
   enabled?: boolean;
+  resetSeed?: number;
 };
 
-function clamp01(n: number) {
-  return Math.max(0, Math.min(1, n));
-}
+function clamp01(n: number) { return Math.max(0, Math.min(1, n)); }
 
-export default function IgnoreRegionCrop({ imageUrl, regions, onChange, enabled = true }: Props) {
+export default function IgnoreRegionCrop({ imageUrl, regions, onChange, enabled = true, resetSeed = 0 }: Props) {
   const imgRef = useRef<HTMLImageElement | null>(null);
-  const [crop, setCrop] = useState<Crop>(() => {
-    const r = regions[0];
-    return r
-      ? { unit: "%", x: r.x * 100, y: r.y * 100, width: r.w * 100, height: r.h * 100 }
-      : { unit: "%", x: 10, y: 10, width: 30, height: 20 };
-  });
+  const renderSize = useRef<{ w: number; h: number }>({ w: 1, h: 1 });
 
-  // When image changes, sync crop from regions if present
-  useEffect(() => {
+  const defaultCropPx = () => {
+    const { w, h } = renderSize.current;
+    return { unit: "px", x: Math.round(w * 0.1), y: Math.round(h * 0.1), width: Math.round(w * 0.3), height: Math.round(h * 0.2) } as Crop;
+  };
+
+  const [crop, setCrop] = useState<Crop>(() => defaultCropPx());
+
+  useLayoutEffect(() => {
+    const img = imgRef.current;
+    if (!img) return;
+    const rect = img.getBoundingClientRect();
+    renderSize.current = { w: Math.max(1, Math.round(rect.width)), h: Math.max(1, Math.round(rect.height)) };
     const r = regions[0];
     if (r) {
-      setCrop({ unit: "%", x: r.x * 100, y: r.y * 100, width: r.w * 100, height: r.h * 100 });
+      setCrop({
+        unit: "px",
+        x: r.x * renderSize.current.w,
+        y: r.y * renderSize.current.h,
+        width: r.w * renderSize.current.w,
+        height: r.h * renderSize.current.h,
+      });
+    } else {
+      setCrop(defaultCropPx());
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [imageUrl]);
+  }, [imageUrl, regions.length]);
+
+  useEffect(() => {
+    setCrop(defaultCropPx());
+  }, [resetSeed]);
+
+  useEffect(() => {
+    if (enabled && (!regions || regions.length === 0)) {
+      setCrop(defaultCropPx());
+    }
+  }, [enabled]); // eslint-disable-line
 
   const onImageLoaded = (img: HTMLImageElement) => {
     imgRef.current = img;
+    requestAnimationFrame(() => {
+      const rect = img.getBoundingClientRect();
+      renderSize.current = { w: Math.max(1, Math.round(rect.width)), h: Math.max(1, Math.round(rect.height)) };
+      if (!regions || regions.length === 0) {
+        setCrop(defaultCropPx());
+      }
+    });
   };
 
-  // Convert % crop -> natural pixel crop -> normalized [0..1] and pad by 1px
   const commit = (c: Crop) => {
     const img = imgRef.current;
     if (!img || !c?.width || !c?.height) {
       onChange([]);
       return;
     }
-
     const natW = img.naturalWidth || img.width;
     const natH = img.naturalHeight || img.height;
+    const { w: rw, h: rh } = renderSize.current;
 
-    // % -> px in natural space
-    let pxX = Math.round(((c.x ?? 0) / 100) * natW);
-    let pxY = Math.round(((c.y ?? 0) / 100) * natH);
-    let pxW = Math.round(((c.width ?? 0) / 100) * natW);
-    let pxH = Math.round(((c.height ?? 0) / 100) * natH);
+    const scaleX = natW / rw;
+    const scaleY = natH / rh;
 
-    // small padding to cover antialiasing around text/edges
-    const PAD = 1;
+    let pxX = Math.round((c.x ?? 0) * scaleX);
+    let pxY = Math.round((c.y ?? 0) * scaleY);
+    let pxW = Math.round((c.width ?? 0) * scaleX);
+    let pxH = Math.round((c.height ?? 0) * scaleY);
+
+    const PAD = 2; // small padding for robustness
     pxX = Math.max(0, pxX - PAD);
     pxY = Math.max(0, pxY - PAD);
     pxW = Math.min(natW - pxX, pxW + PAD * 2);
@@ -69,13 +97,35 @@ export default function IgnoreRegionCrop({ imageUrl, regions, onChange, enabled 
     onChange([r]);
   };
 
+  const rafRef = useRef<number | null>(null);
+  const onChangeDebounced = (c: Crop) => {
+    setCrop(c);
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = requestAnimationFrame(() => commit(c));
+  };
+
+  if (!enabled) {
+    return (
+      <div>
+        <img
+          src={imageUrl}
+          alt="before"
+          ref={imgRef as any}
+          onLoad={(e) => onImageLoaded(e.currentTarget)}
+          style={{ display: "block", width: "100%", height: "auto" }}
+        />
+        <div className="muted" style={{ marginTop: 6 }}>Toggle “Ignore regions” to edit selection</div>
+      </div>
+    );
+  }
+
   return (
     <div>
       <ReactCrop
         crop={crop}
-        onChange={(c) => setCrop(c)}          // live UI update
-        onComplete={(c) => commit(c)}         // commit only when the user stops dragging
-        disabled={!enabled}
+        onChange={onChangeDebounced}
+        onComplete={(c) => commit(c)}
+        disabled={false}
         keepSelection
         ruleOfThirds={false}
       >
@@ -87,12 +137,6 @@ export default function IgnoreRegionCrop({ imageUrl, regions, onChange, enabled 
           style={{ display: "block", width: "100%", height: "auto" }}
         />
       </ReactCrop>
-
-      {!enabled && (
-        <div className="muted" style={{ marginTop: 6 }}>
-          Toggle “Ignore regions” to edit selection
-        </div>
-      )}
     </div>
   );
 }

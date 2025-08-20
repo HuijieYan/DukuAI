@@ -5,18 +5,27 @@ const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8000";
 function absolutizeUrls<T extends { urls?: Record<string, string> }>(obj: T): T {
   if (!obj?.urls) return obj;
   const abs = (p: string) => (p?.startsWith("http") ? p : `${API_BASE}${p}`);
-  return { ...obj, urls: { before: abs(obj.urls.before), after: abs(obj.urls.after), diff: abs(obj.urls.diff) } };
+  return {
+    ...obj,
+    urls: {
+      ...obj.urls,
+      before: abs(obj.urls.before),
+      after:  abs(obj.urls.after),
+      diff:   abs(obj.urls.diff),
+    },
+  };
 }
 
 export async function createComparison(
   before: File,
   after: File,
-  sensitivity: number,
+  sensitivity: number,   // 0..100 slider (higher = more sensitive)
   regions: Region[]
 ): Promise<ComparisonResult> {
   const fd = new FormData();
   fd.append("before", before);
   fd.append("after", after);
+  // Invert slider -> backend cutoff (0..255). Higher sensitivity => lower cutoff.
   const cutoff = Math.round(((100 - sensitivity) / 100) * 255);
   fd.append("threshold", String(cutoff));
   if (regions.length) fd.append("ignore_regions", JSON.stringify(regions));
@@ -26,7 +35,11 @@ export async function createComparison(
   return absolutizeUrls(data);
 }
 
-export async function recomputeComparison(id: string, sensitivity: number, regions: Region[]): Promise<ComparisonResult> {
+export async function recomputeComparison(
+  id: string,
+  sensitivity: number,
+  regions: Region[]
+): Promise<ComparisonResult> {
   const fd = new FormData();
   const cutoff = Math.round(((100 - sensitivity) / 100) * 255);
   fd.append("threshold", String(cutoff));
@@ -39,7 +52,8 @@ export async function recomputeComparison(id: string, sensitivity: number, regio
 export async function getComparison(id: string): Promise<ComparisonResult> {
   const res = await fetch(`${API_BASE}/comparison/${id}`);
   if (!res.ok) throw new Error("Not found");
-  return absolutizeUrls(await res.json());
+  const data = await res.json();
+  return absolutizeUrls(data);
 }
 
 export async function listComparisons(): Promise<ComparisonResult[]> {
@@ -47,6 +61,7 @@ export async function listComparisons(): Promise<ComparisonResult[]> {
   if (!res.ok) return [];
   const j = await res.json();
   const items = (j.items ?? []) as any[];
+  // Synthesize URLs defensively in case backend list doesn't include them
   return items.map((m) => ({
     ...m,
     urls: {
